@@ -1,0 +1,128 @@
+name: macOS DMG
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'main'
+      - 'macos-*'
+    paths:
+      - '.github/workflows/macos-dmg.yaml'
+      - 'CMakeLists.txt'
+      - 'libs/**'
+      - 'ui/**'
+      - 'po/**'
+      - 'cmake/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos-dmg:
+    name: Build macOS DMG (arm64)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup build environment
+        run: |
+          brew install gettext qt python3 boost googletest ninja spdlog pkg-config || true
+          brew link gettext --force
+          brew outdated cmake || brew upgrade cmake
+          pip3 install --break-system-packages --user Jinja2
+
+      - name: Configure
+        run: |
+          QT_PREFIX="$(brew --prefix qt)"
+          cmake -S . -B _build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/_install" \
+            -DCMAKE_PREFIX_PATH="${QT_PREFIX}" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DWITH_UI=Qt \
+            -DWITH_TESTS=ON \
+            -DWITH_INDICATOR=OFF \
+            -DWITH_GSTREAMER=OFF \
+            -DWITH_PULSE=OFF \
+            -DWITH_GNOME_CLASSIC_PANEL=OFF
+
+      - name: Build
+        run: cmake --build _build -j "$(sysctl -n hw.ncpu)"
+
+      - name: Test
+        run: ctest --test-dir _build --output-on-failure
+
+      - name: Package DMG
+        run: cmake --build _build --target dmg
+
+      - name: Verify DMG and app bundle
+        run: |
+          set -euo pipefail
+          DMG_PATH="$(find _install -maxdepth 1 -name '*.dmg' -print -quit)"
+          if [ -z "$DMG_PATH" ]; then
+            echo "ERROR: No DMG found in _install"
+            ls -la _install
+            exit 1
+          fi
+          echo "Found DMG: $DMG_PATH"
+          ls -lh "$DMG_PATH"
+          shasum -a 256 "$DMG_PATH" | tee "${DMG_PATH}.sha256"
+
+          MOUNT_DIR="$(mktemp -d /tmp/workrave-dmg-verify.XXXXXX)"
+          cleanup() {
+            hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1 || hdiutil detach -force "$MOUNT_DIR" >/dev/null 2>&1 || true
+            rmdir "$MOUNT_DIR" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach -readonly -nobrowse -noverify -mountpoint "$MOUNT_DIR" "$DMG_PATH"
+          APP="$MOUNT_DIR/Workrave.app"
+          test -d "$APP"
+          test -x "$APP/Contents/MacOS/Workrave"
+          test -L "$MOUNT_DIR/Applications"
+
+          echo "--- Info.plist ---"
+          plutil -lint "$APP/Contents/Info.plist"
+          plutil -p "$APP/Contents/Info.plist"
+
+          echo "--- Code signature ---"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          echo "--- Main binary dependencies ---"
+          otool -L "$APP/Contents/MacOS/Workrave"
+
+          echo "--- Check for leaked build-machine dylib references ---"
+          LEAKS=""
+          while IFS= read -r -d '' bin; do
+            if file "$bin" | grep -q "Mach-O"; then
+              BAD="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -E '^(/opt/homebrew|/usr/local/Cellar|/usr/local/opt)' || true)"
+              if [ -n "$BAD" ]; then
+                echo "LEAK in $bin:"
+                echo "$BAD"
+                LEAKS="yes"
+              fi
+            fi
+          done < <(find "$APP/Contents" -type f \( -perm -111 -o -name '*.dylib' -o -name '*.so' \) -print0)
+          if [ -n "$LEAKS" ]; then
+            echo "ERROR: Found unbundled Homebrew/local dylib references in Workrave.app"
+            exit 1
+          fi
+
+          echo "--- Bundled Qt plugins & QML ---"
+          test -f "$APP/Contents/PlugIns/platforms/libqcocoa.dylib"
+          ls -la "$APP/Contents/PlugIns" "$APP/Contents/Resources/qml"
+
+          echo "Verification passed!"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workrave-macos-arm64-dmg
+          path: |
+            _install/*.dmg
+            _install/*.dmg.sha256
+          if-no-files-found: error
